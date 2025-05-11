@@ -38,13 +38,11 @@ public class AuthController {
         User registeredUser = userService.registerUser(user, roles);
         return ResponseEntity.ok(Map.of(
                 "message", "User registered successfully",
-                "user", registeredUser
-        ));
+                "user", registeredUser));
     }
 
     @PostMapping("/login")
     public ResponseEntity<?> authenticateUser(@RequestBody LoginDTO loginDTO) {
-        // Assuming login() returns a JWT or throws an exception if credentials are invalid
         String token = authService.login(loginDTO.getEmail(), loginDTO.getPassword());
 
         Map<String, Object> response = new HashMap<>();
