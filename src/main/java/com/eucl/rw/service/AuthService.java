@@ -1,13 +1,18 @@
 package com.eucl.rw.service;
 
-
+import com.eucl.rw.response.AuthResponse;
 import java.util.UUID;
 
-
 public interface AuthService {
-    String login(String email, String password);
+    AuthResponse login(String email, String password);
+
     UUID getCurrentUserId();
+
     boolean isAuthenticated();
+
     boolean hasRole(String roleName);
-    String refreshToken(String oldToken);
+
+    AuthResponse refreshToken(String oldToken);
+
+    void logout(String accessToken);
 }

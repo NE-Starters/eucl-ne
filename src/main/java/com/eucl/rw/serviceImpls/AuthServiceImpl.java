@@ -1,11 +1,14 @@
 package com.eucl.rw.serviceImpls;
 
+import com.eucl.rw.model.RefreshToken;
 import com.eucl.rw.model.User;
 import com.eucl.rw.service.AuthService;
+import com.eucl.rw.service.RefreshTokenService;
 import com.eucl.rw.service.UserService;
 import com.eucl.rw.util.JwtTokenUtil;
 import com.eucl.rw.util.UserPrincipal;
-import io.jsonwebtoken.*;
+import com.eucl.rw.response.AuthResponse;
+import io.jsonwebtoken.JwtException;
 import lombok.RequiredArgsConstructor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -24,78 +27,102 @@ public class AuthServiceImpl implements AuthService {
 
     private final JwtTokenUtil jwtTokenUtil;
     private final UserService userService;
+    private final RefreshTokenService refreshTokenService;
 
     private static final Logger logger = LoggerFactory.getLogger(AuthServiceImpl.class);
 
-
-    @Value("${app.jwt.secret}")
-    private String jwtSecret;
+    @Value("${app.jwt.access-token-expiration-ms:900000}") // 15 minutes
+    private int accessTokenExpirationMs;
 
     @Override
-    public String login(String email, String password) {
-        User user = userService.authenticateUser(email, password); // Ensure authentication checks credentials
-        return jwtTokenUtil.generateToken(user); // Returns JWT token
+    public AuthResponse login(String email, String password) {
+        try {
+            User user = userService.authenticateUser(email, password);
+            String accessToken = jwtTokenUtil.generateAccessToken(user);
+            String refreshToken = refreshTokenService.createRefreshToken(user).getToken();
+            logger.info("User {} logged in successfully", email);
+            return new AuthResponse(accessToken, refreshToken);
+        } catch (Exception e) {
+            logger.error("Login failed for user {}: {}", email, e.getMessage());
+            throw new SecurityException("Invalid credentials", e);
+        }
     }
 
     @Override
     public UUID getCurrentUserId() {
         Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
-        if (authentication != null && authentication.getPrincipal() instanceof UserPrincipal) {
-            UserPrincipal userPrincipal = (UserPrincipal) authentication.getPrincipal();
+        if (authentication != null && authentication.getPrincipal() instanceof UserPrincipal userPrincipal) {
             return userPrincipal.getId();
         }
-        throw new RuntimeException("Unauthenticated");
+        logger.warn("Attempt to access user ID without authentication");
+        throw new SecurityException("Unauthenticated");
     }
 
     @Override
     public boolean isAuthenticated() {
-        return SecurityContextHolder.getContext().getAuthentication() != null;
+        return SecurityContextHolder.getContext().getAuthentication() != null &&
+               SecurityContextHolder.getContext().getAuthentication().isAuthenticated();
     }
 
     @Override
     public boolean hasRole(String roleName) {
         Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
         if (authentication != null && authentication.getAuthorities() != null) {
-            return authentication.getAuthorities().stream()
+            boolean hasRole = authentication.getAuthorities().stream()
                     .anyMatch(authority -> authority.getAuthority().equals(roleName));
+            logger.debug("Checking role {}: {}", roleName, hasRole);
+            return hasRole;
         }
+        logger.warn("No authentication found for role check: {}", roleName);
         return false;
     }
 
     @Override
-    public String refreshToken(String oldToken) {
-        if (validateToken(oldToken)) {
-            String email = jwtTokenUtil.getUserNameFromJwtToken(oldToken);
-            User user = userService.getUserByEmail(email); // Fetch user using the email
-            return jwtTokenUtil.generateToken(user); // Generate new token based on user info
+    public AuthResponse refreshToken(String refreshToken) {
+        try {
+            RefreshToken token = refreshTokenService.validateRefreshToken(refreshToken);
+            User user = userService.getUserById(token.getUserId());
+            String newAccessToken = jwtTokenUtil.generateAccessToken(user);
+            String newRefreshToken = refreshTokenService.rotateRefreshToken(token).getToken();
+            logger.info("Token refreshed for user ID: {}", user.getId());
+            return new AuthResponse(newAccessToken, newRefreshToken);
+        } catch (Exception e) {
+            logger.error("Token refresh failed: {}", e.getMessage());
+            throw new SecurityException("Invalid or expired refresh token", e);
         }
-        throw new RuntimeException("Invalid or expired token");
     }
 
-    private String getEmailFromToken(String token) {
-        Claims claims = Jwts.parserBuilder()
-                .setSigningKey(jwtSecret)
-                .build()
-                .parseClaimsJws(token)
-                .getBody();
-        return claims.getSubject();
+    @Override
+    public void logout(String accessToken) {
+        if (jwtTokenUtil.validateJwtToken(accessToken)) {
+            jwtTokenUtil.blacklistToken(accessToken, accessTokenExpirationMs);
+            logger.info("User logged out, token blacklisted");
+        } else {
+            logger.warn("Attempt to logout with invalid token");
+            throw new SecurityException("Invalid token");
+        }
     }
 
     public Authentication getAuthentication(String token) {
-        UserDetails userDetails = userService.loadUserByUsername(getEmailFromToken(token));
+        if (jwtTokenUtil.isTokenBlacklisted(token)) {
+            logger.warn("Attempt to use blacklisted token");
+            throw new SecurityException("Token is blacklisted");
+        }
+        String email = jwtTokenUtil.getUserNameFromJwtToken(token);
+        UserDetails userDetails = userService.loadUserByUsername(email);
         return new UsernamePasswordAuthenticationToken(userDetails, "", userDetails.getAuthorities());
     }
 
     public boolean validateToken(String authToken) {
         try {
-            Jwts.parserBuilder()
-                    .setSigningKey(jwtSecret)
-                    .build()
-                    .parseClaimsJws(authToken); // Throws exception if invalid
-            return true;
+            if (jwtTokenUtil.isTokenBlacklisted(authToken)) {
+                logger.warn("Token is blacklisted");
+                return false;
+            }
+            return jwtTokenUtil.validateJwtToken(authToken);
         } catch (JwtException ex) {
-            logger.error("JWT validation failed: {}", ex);
+            logger.error("JWT validation failed: {}", ex.getMessage());
+            return false;
         }
-        return false;
     }
 }
