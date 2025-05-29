@@ -3,24 +3,24 @@ package com.eucl.rw.util;
 import com.eucl.rw.model.User;
 import io.jsonwebtoken.*;
 import io.jsonwebtoken.security.Keys;
-import lombok.AllArgsConstructor;
 import lombok.NoArgsConstructor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.security.core.Authentication;
-import org.springframework.security.core.GrantedAuthority;
 import org.springframework.stereotype.Component;
 
+import javax.cache.Cache;
+import javax.cache.CacheManager;
+import javax.cache.Caching;
+import javax.cache.configuration.MutableConfiguration;
+import javax.cache.expiry.Duration;
+import javax.cache.expiry.ModifiedExpiryPolicy;
 import javax.crypto.SecretKey;
+
 import java.util.Date;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.stream.Collectors;
+import java.util.UUID;
 
 @Component
-@AllArgsConstructor
 @NoArgsConstructor
 public class JwtTokenUtil {
 
@@ -29,57 +29,36 @@ public class JwtTokenUtil {
     @Value("${app.jwt.secret}")
     private String jwtSecret;
 
-    @Value("${app.jwt.expiration-ms}")
-    private int jwtExpirationMs;
+    @Value("${app.jwt.access-token-expiration-ms:900000}") // 15 minutes
+    private int accessTokenExpirationMs;
+
+    private Cache<String, Boolean> tokenBlacklist;
+
+    public JwtTokenUtil(@Value("${app.jwt.secret}") String jwtSecret) {
+        this.jwtSecret = jwtSecret;
+        this.tokenBlacklist = initializeBlacklistCache();
+    }
+
+    private Cache<String, Boolean> initializeBlacklistCache() {
+        CacheManager cacheManager = Caching.getCachingProvider().getCacheManager();
+        MutableConfiguration<String, Boolean> config = new MutableConfiguration<String, Boolean>()
+                .setTypes(String.class, Boolean.class)
+                .setExpiryPolicyFactory(ModifiedExpiryPolicy.factoryOf(Duration.ONE_DAY))
+                .setStoreByValue(false);
+        return cacheManager.createCache("tokenBlacklist", config);
+    }
 
     private SecretKey getSigningKey() {
         return Keys.hmacShaKeyFor(jwtSecret.getBytes());
     }
 
-    public String generateJwtToken(Authentication authentication) {
-        UserPrincipal userPrincipal = (UserPrincipal) authentication.getPrincipal();
-
-        List<String> roles = userPrincipal.getAuthorities().stream()
-                .map(GrantedAuthority::getAuthority)
-                .collect(Collectors.toList());
-
+    public String generateAccessToken(User user) {
         Date now = new Date();
-        Date expiry = new Date(now.getTime() + jwtExpirationMs);
-
-        return Jwts.builder()
-                .setSubject(userPrincipal.getUsername())
-                .claim("roles", roles)
-                .claim("userId", userPrincipal.getId())
-                .setIssuedAt(now)
-                .setExpiration(expiry)
-                .signWith(getSigningKey(), SignatureAlgorithm.HS512)
-                .compact();
-    }
-
-    public String generateToken(User user) {
-        Date now = new Date();
-        Date expiry = new Date(now.getTime() + jwtExpirationMs);
-
-        Map<String, Object> claims = new HashMap<>();
-        claims.put("username", user.getName());
-        claims.put("roles", user.getRoles());
-        claims.put("userId", user.getId());
+        Date expiry = new Date(now.getTime() + accessTokenExpirationMs);
 
         return Jwts.builder()
                 .setSubject(user.getEmail())
-                .addClaims(claims)
-                .setIssuedAt(now)
-                .setExpiration(expiry)
-                .signWith(getSigningKey(), SignatureAlgorithm.HS512)
-                .compact();
-    }
-
-    public String generateTokenFromUsername(String username) {
-        Date now = new Date();
-        Date expiry = new Date(now.getTime() + jwtExpirationMs);
-
-        return Jwts.builder()
-                .setSubject(username)
+                .claim("userId", user.getId().toString())
                 .setIssuedAt(now)
                 .setExpiration(expiry)
                 .signWith(getSigningKey(), SignatureAlgorithm.HS512)
@@ -95,27 +74,22 @@ public class JwtTokenUtil {
                 .getSubject();
     }
 
-    public Long getUserIdFromJwtToken(String token) {
-        return Jwts.parserBuilder()
+    public UUID getUserIdFromJwtToken(String token) {
+        String userId = Jwts.parserBuilder()
                 .setSigningKey(getSigningKey())
                 .build()
                 .parseClaimsJws(token)
                 .getBody()
-                .get("userId", Long.class);
-    }
-
-    @SuppressWarnings("unchecked")
-    public List<String> getRolesFromJwtToken(String token) {
-        return (List<String>) Jwts.parserBuilder()
-                .setSigningKey(getSigningKey())
-                .build()
-                .parseClaimsJws(token)
-                .getBody()
-                .get("roles", List.class);
+                .get("userId", String.class);
+        return UUID.fromString(userId);
     }
 
     public boolean validateJwtToken(String authToken) {
         try {
+            if (isTokenBlacklisted(authToken)) {
+                logger.warn("Attempt to use blacklisted token");
+                return false;
+            }
             Jwts.parserBuilder()
                     .setSigningKey(getSigningKey())
                     .build()
@@ -133,5 +107,16 @@ public class JwtTokenUtil {
             logger.error("JWT claims string is empty: {}", e.getMessage());
         }
         return false;
+    }
+
+    public boolean isTokenBlacklisted(String token) {
+        return tokenBlacklist != null && tokenBlacklist.containsKey(token);
+    }
+
+    public void blacklistToken(String token, long expirationMs) {
+        if (tokenBlacklist != null) {
+            tokenBlacklist.put(token, true);
+            logger.info("Token blacklisted: {}", token);
+        }
     }
 }
